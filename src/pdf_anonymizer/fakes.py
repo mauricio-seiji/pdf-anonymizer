@@ -18,11 +18,28 @@ EntityKind = Literal[
     "ctc_contract",
 ]
 
-DEFAULT_NAME_REPLACEMENT = "MARIA DA SILVA"
-
 # CTC0003924227 -> CTC + trunk(000392) + suffix(4227)
 CTC_CONTRACT_PATTERN = re.compile(r"^CTC(000392)(\d{4})$")
 CTC_TRUNK_ORIGINAL = "000392"
+
+NB_PATTERN = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d\b")
+AUTH_CODE_PATTERN = re.compile(r"\b\d{6}[A-Z0-9]{6,}-[A-Z0-9]{6,}\b")
+
+
+def is_auth_code(token: str) -> bool:
+    if not AUTH_CODE_PATTERN.fullmatch(token):
+        return False
+    return any(c.isalpha() for c in token)
+CTC_PATTERN = re.compile(r"\bCTC\d{10}\b")
+HYPHEN_CONTRACT = re.compile(r"\b\d{6,}-\d{1,3}\b")
+SLASH_CONTRACT = re.compile(
+    r"\b\d{2}-\d{6,9}/(?:\d{2}(?:_\d{2})?|\d{5})(?!\d)\b"
+)
+LONG_DIGITS = re.compile(r"(?<![\d.,/])\d{8,}(?!\d)")
+CARD_UNDERSCORE = re.compile(r"(\d{10})_\d{2}")
+
+CARD_PREFIX_MIN_LEN = 15
+CARD_PREFIX_TAIL_LEN = 4
 
 
 @dataclass(frozen=True)
@@ -56,7 +73,6 @@ def preserve_case(original: str, replacement: str) -> str:
 
 
 def _fake_digit_at(rng: random.Random, original_digit: str) -> str:
-    """Return a random digit different from *original_digit* at this position."""
     choices = [str(d) for d in range(10) if str(d) != original_digit]
     return rng.choice(choices)
 
@@ -81,9 +97,6 @@ def _generate_digit_string(original: str, rng: random.Random) -> str:
 
 def generate_fake(original: str, kind: EntityKind, rng: random.Random) -> str:
     """Generate a fake value with the same length and separator layout."""
-    if kind == "name":
-        return preserve_case(original, DEFAULT_NAME_REPLACEMENT)
-
     out: list[str] = []
     for ch in original:
         if ch.isdigit():
@@ -103,7 +116,6 @@ def _generate_ctc_batch(
     fake_values: set[str],
     originals: set[str],
 ) -> dict[str, str]:
-    """CTC literal + shared fake trunk + distinct 4-digit suffixes."""
     fake_trunk = _generate_digit_string(CTC_TRUNK_ORIGINAL, rng)
     while fake_trunk == CTC_TRUNK_ORIGINAL or fake_trunk in fake_values:
         rng2 = random.Random(rng.randint(0, 999999))
@@ -159,7 +171,10 @@ def build_mapping(
             continue
 
         if entity.replacement is not None:
-            fake = entity.replacement
+            if entity.kind == "name":
+                fake = preserve_case(original, entity.replacement)
+            else:
+                fake = entity.replacement
         else:
             fake = generate_fake(original, entity.kind, rng)
 
@@ -185,20 +200,3 @@ def apply_prefix_mapping(full: str, prefix: str, fake_prefix: str) -> str:
     if not full.startswith(prefix):
         return full
     return fake_prefix + full[len(prefix) :]
-
-
-# Patterns for discovery classification
-NB_PATTERN = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d\b")
-AUTH_CODE_PATTERN = re.compile(r"\b\d{6}[A-Z0-9]{6,}-[A-Z0-9]{6,}\b")
-CTC_PATTERN = re.compile(r"\bCTC\d{10}\b")
-HYPHEN_CONTRACT = re.compile(r"\b\d{6,}-\d\b")
-LONG_DIGITS = re.compile(r"(?<![A-Za-z\d])\d{9,}(?!\d)")
-CARD_UNDERSCORE = re.compile(r"(\d{10})_\d{2}")
-
-KNOWN_NAME = "MARIA DE FATIMA RAMALHO MIRANDA"
-KNOWN_ACCOUNT = "8378380341"
-KNOWN_AGENCY = "2130"
-
-# Prefix families: base digits only; suffix MMAA preserved at match time
-CARD_PREFIX_MIN_LEN = 15
-CARD_PREFIX_TAIL_LEN = 4

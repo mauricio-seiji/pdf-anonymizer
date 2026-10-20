@@ -11,9 +11,24 @@ from pdf_anonymizer.matcher import (
     TextFragment,
     extract_page_chars,
     find_matches,
-    find_name_fragment,
+    find_name_fragments,
     rotate_from_dir,
 )
+
+_BASE14: dict[str, str] = {
+    "helvetica": "helv",
+    "helvetica-bold": "hebo",
+    "helvetica-oblique": "heit",
+    "helvetica-boldoblique": "hebi",
+    "times-roman": "tiro",
+    "times-bold": "tibo",
+    "times-italic": "tiit",
+    "times-bolditalic": "tibi",
+    "courier": "cour",
+    "courier-bold": "cobo",
+    "courier-oblique": "coit",
+    "courier-boldoblique": "cobo",
+}
 
 
 def _color_from_int(color: int) -> tuple[float, float, float]:
@@ -35,10 +50,13 @@ class FontCache:
         if xref in self._names:
             return self._names[xref]
         if xref == 0:
-            self._names[0] = "helv"
-            return "helv"
+            font = span.get("font", "") or ""
+            base = _BASE14.get(font.lower().split("+")[-1], "helv")
+            self._names[0] = base
+            return base
         try:
-            _, _, _, buffer = doc.extract_font(xref)
+            name, _, _, buffer = doc.extract_font(xref)
+            del name
             if buffer:
                 self._buffers[xref] = buffer
             font_id = f"anon{xref}"
@@ -66,9 +84,7 @@ def _collect_fragments(
     for entity in entities:
         if entity.kind == "name":
             fake = mapping[entity.original]
-            frag = find_name_fragment(page_chars, entity.original, fake)
-            if frag:
-                fragments.append(frag)
+            fragments.extend(find_name_fragments(page_chars, entity.original, fake))
 
     non_name = [e for e in entities if e.kind != "name"]
     fragments.extend(find_matches(page_chars, non_name, mapping))
@@ -109,6 +125,8 @@ def _write_fragment_text(
     doc: fitz.Document,
     fragment: TextFragment,
     font_cache: FontCache,
+    *,
+    shrink_to_rect: bool = False,
 ) -> None:
     if not fragment.chars:
         return
@@ -123,6 +141,17 @@ def _write_fragment_text(
     fontsize = first.fontsize
     rot = rotate_from_dir(first.dir)
     point = fitz.Point(first.origin[0], first.origin[1])
+
+    if shrink_to_rect and fragment.fake_text:
+        rect = fragment.rect
+        width = rect.width
+        try:
+            text_w = fitz.get_text_length(fragment.fake_text, fontname=fontname, fontsize=fontsize)
+            if text_w > width and width > 0:
+                fontsize = max(4.0, fontsize * (width / text_w) * 0.95)
+        except Exception:
+            pass
+
     _insert_at(page, point, fragment.fake_text, fontname, fontsize, color, rot)
 
 
@@ -144,7 +173,9 @@ def _apply_fragments(
     )
 
     for frag in fragments:
-        _write_fragment_text(page, doc, frag, font_cache)
+        _write_fragment_text(
+            page, doc, frag, font_cache, shrink_to_rect=frag.is_name
+        )
 
 
 def anonymize_page(
