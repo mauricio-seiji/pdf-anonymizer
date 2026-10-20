@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 output/
+cases/
 mapping.json
 entities.yaml
 *.egg-info/

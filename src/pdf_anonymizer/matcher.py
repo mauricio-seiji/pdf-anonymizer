@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import pymupdf as fitz
 
 from pdf_anonymizer.fakes import Entity, apply_prefix_mapping
+from pdf_anonymizer.text_utils import alnum_skeleton, map_alnum_to_fake
 
 
 @dataclass
@@ -37,6 +38,7 @@ class TextFragment:
     """Contiguous chars from one visual line within a match."""
     chars: list[CharInfo]
     fake_text: str
+    is_name: bool = False
 
     @property
     def rect(self) -> fitz.Rect:
@@ -106,11 +108,9 @@ def _lines_mergeable(prev: LineRun, curr: LineRun) -> bool:
     if not _intervals_overlap(prev_text, curr_text):
         return False
 
-    # Same column / band: stack intervals overlap (e.g. wrapped lines in Parecer)
     if _intervals_overlap(prev_stack, curr_stack):
         return True
 
-    # Narrow adjacent strips (HISCON table cells split across lines in one column)
     prev_width = prev_stack[1] - prev_stack[0]
     curr_width = curr_stack[1] - curr_stack[0]
     max_width = max(prev_width, curr_width)
@@ -164,7 +164,6 @@ def _extract_line_runs(page: fitz.Page) -> list[LineRun]:
 
 
 def build_logical_segments(page: fitz.Page) -> list[TextSegment]:
-    """Merge adjacent lines that belong to the same table cell."""
     runs = _extract_line_runs(page)
     if not runs:
         return []
@@ -190,34 +189,14 @@ def _same_line(a: CharInfo, b: CharInfo) -> bool:
 
 
 def _build_normalized_segment(segment: TextSegment) -> None:
-    """Build normalized string for one segment; drop soft hyphens only."""
+    """Build normalized string 1:1 with chars (hyphens kept; pattern tolerates breaks)."""
     chars = segment.chars
     normalized: list[str] = []
     norm_to_char: list[int] = []
 
-    i = 0
-    while i < len(chars):
-        c = chars[i].char
-
-        if c == "-":
-            j = i + 1
-            while j < len(chars) and chars[j].char == "-":
-                j += 1
-            if j > i + 1 and j < len(chars):
-                i = j
-                continue
-            if (
-                j < len(chars)
-                and not _same_line(chars[i], chars[j])
-                and (chars[i - 1].char.isalnum() if i > 0 else False)
-                and chars[j].char.isalnum()
-            ):
-                i = j
-                continue
-
-        normalized.append(c)
+    for i, ch in enumerate(chars):
+        normalized.append(ch.char)
         norm_to_char.append(i)
-        i += 1
 
     segment.normalized = "".join(normalized)
     segment.norm_to_char = norm_to_char
@@ -230,7 +209,6 @@ def extract_page_chars(page: fitz.Page) -> PageChars:
 
 
 def collect_segment_texts(doc: fitz.Document) -> str:
-    """All segment-normalized strings from a document (for discovery)."""
     parts: list[str] = []
     for page in doc:
         for seg in build_logical_segments(page):
@@ -254,11 +232,12 @@ def _group_by_line(char_indices: list[int], chars: list[CharInfo]) -> list[list[
     return groups
 
 
-def _fake_for_match(original_slice: str, entity: Entity, mapping: dict[str, str]) -> str:
+def _fake_for_match(matched_text: str, entity: Entity, mapping: dict[str, str]) -> str:
     if entity.kind == "contract_prefix":
         fake_prefix = mapping[entity.original]
-        return apply_prefix_mapping(original_slice, entity.original, fake_prefix)
-    return mapping.get(entity.original, original_slice)
+        return apply_prefix_mapping(matched_text, entity.original, fake_prefix)
+    fake_full = mapping.get(entity.original, matched_text)
+    return map_alnum_to_fake(matched_text, fake_full)
 
 
 def _find_anchor_positions(normalized: str, anchor: str) -> list[int]:
@@ -275,25 +254,51 @@ def _find_anchor_positions(normalized: str, anchor: str) -> list[int]:
     return positions
 
 
+def _match_tail() -> str:
+    """End anchor tolerant to glued competência/dates (e.g. /1913/12)."""
+    return r"(?=\d{2}/|/|\D|$|-)"
+
+
+def _flex_separator(sep: str) -> str:
+    if sep == "-":
+        return r"-{1,3}"
+    if sep == "/":
+        return r"(?:/+|/-*)"
+    if sep == "_":
+        return r"(?:_+|_-+|-*)"
+    return r"(?:" + re.escape(sep) + r"|-)*"
+
+
 def _compile_pattern(entity: Entity) -> str:
     original = entity.original
 
     if entity.kind == "contract_prefix":
         return re.escape(original) + r"\d{0,4}"
 
-    if entity.kind == "contract" and "-" in original:
-        parts = original.split("-")
-        return re.escape(parts[0]) + r"-+" + re.escape(parts[1])
+    if original.isdigit():
+        body = "-?".join(re.escape(c) for c in original)
+        # Allow glued competência (e.g. 1549896282 + 05/08 -> 154989628205/08)
+        tail = _match_tail()
+        if len(original) <= 6 and not entity.anchor:
+            return rf"(?<![\d]){body}{tail}"
+        return rf"(?<![\d]){body}{tail}"
 
-    escaped = re.escape(original)
+    chunks = re.split(r"([^A-Za-z0-9]+)", original)
+    body_parts: list[str] = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if chunk[0].isalnum():
+            body_parts.append(re.escape(chunk))
+        else:
+            body_parts.append(_flex_separator(chunk))
 
-    if original.isdigit() and len(original) <= 6 and not entity.anchor:
-        return rf"(?<!\d){escaped}(?!\d)"
+    body = "".join(body_parts)
 
     if entity.anchor and original.isdigit():
-        return rf"(?<!\d){escaped}(?!\d)"
+        return rf"(?<![\d]){re.escape(original)}{_match_tail()}"
 
-    return escaped
+    return rf"(?<![\d]){body}{_match_tail()}"
 
 
 def _find_matches_in_segment(
@@ -326,6 +331,10 @@ def _find_matches_in_segment(
 
             matched_text = normalized[start:end]
 
+            if entity.kind != "contract_prefix" and entity.kind != "name":
+                if alnum_skeleton(matched_text) != alnum_skeleton(entity.original):
+                    continue
+
             if entity.anchor:
                 anchors = anchor_positions.get(entity.id, [])
                 if not any(abs(start - a) <= max_anchor_distance for a in anchors):
@@ -334,8 +343,8 @@ def _find_matches_in_segment(
             char_indices = [norm_to_char[i] for i in range(start, end)]
             fake = _fake_for_match(matched_text, entity, mapping)
 
-            if entity.kind != "name" and entity.kind != "contract_prefix":
-                if len(fake) != len(matched_text):
+            if entity.kind not in ("name", "contract_prefix"):
+                if alnum_skeleton(fake) != alnum_skeleton(mapping[entity.original]):
                     continue
 
             for line_group in _group_by_line(char_indices, chars):
@@ -357,7 +366,6 @@ def find_matches(
     *,
     max_anchor_distance: int = 40,
 ) -> list[TextFragment]:
-    """Find all entity occurrences on a page; longest patterns first."""
     fragments: list[TextFragment] = []
     for segment in page_chars.segments:
         occupied: set[int] = set()
@@ -373,27 +381,35 @@ def find_matches(
     return fragments
 
 
-def find_name_fragment(
+def find_name_fragments(
     page_chars: PageChars,
     name: str,
     fake_name: str,
-) -> TextFragment | None:
-    """Match beneficiary name as a single unified fragment."""
+) -> list[TextFragment]:
+    """Match beneficiary name; one fragment per visual line per occurrence."""
     name_parts = name.split()
     pattern = r"\s+".join(re.escape(p) for p in name_parts)
+    fragments: list[TextFragment] = []
 
     for segment in page_chars.segments:
-        m = re.search(pattern, segment.normalized)
-        if not m:
-            continue
-        char_indices = [segment.norm_to_char[i] for i in range(m.start(), m.end())]
-        matched_chars = [segment.chars[i] for i in char_indices]
-        return TextFragment(chars=matched_chars, fake_text=fake_name)
-    return None
+        for m in re.finditer(pattern, segment.normalized, flags=re.IGNORECASE):
+            char_indices = [segment.norm_to_char[i] for i in range(m.start(), m.end())]
+            matched_chars = [segment.chars[i] for i in char_indices]
+            matched_text = segment.normalized[m.start() : m.end()]
+            from pdf_anonymizer.fakes import preserve_case
+
+            fake = preserve_case(matched_text, fake_name)
+            for line_group in _group_by_line(char_indices, segment.chars):
+                offset = char_indices.index(line_group[0])
+                fake_slice = fake[offset : offset + len(line_group)]
+                group_chars = [segment.chars[i] for i in line_group]
+                fragments.append(
+                    TextFragment(chars=group_chars, fake_text=fake_slice, is_name=True)
+                )
+    return fragments
 
 
 def rotate_from_dir(dir_vec: tuple[float, float]) -> int:
-    """Map line direction vector to insert_text rotation degrees."""
     dx, dy = dir_vec
     if abs(dx) >= abs(dy):
         return 0 if dx >= 0 else 180

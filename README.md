@@ -30,6 +30,21 @@ uv run pdf-anonymizer run
 uv run pdf-anonymizer validate
 ```
 
+### Um PDF por vez (casos em `cases/`)
+
+```bash
+uv run pdf-anonymizer discover /caminho/para/parecer.pdf \
+  --name "IRENE STOLF" --fake-name "MARIA SOUZA"
+
+uv run pdf-anonymizer run /caminho/para/parecer.pdf \
+  --name "IRENE STOLF" --fake-name "MARIA SOUZA"
+
+uv run pdf-anonymizer validate /caminho/para/parecer.pdf \
+  --name "IRENE STOLF" --fake-name "MARIA SOUZA"
+```
+
+Opcional: `--account` e `--agency` quando o HISCON trouxer conta/agência.
+
 ## Campos anonimizados
 
 - Nome do titular
@@ -44,4 +59,5 @@ uv run pdf-anonymizer validate
 ## Arquivos sensíveis
 
 - `docs/` — PDFs originais (não versionar)
+- `cases/` — PDFs, `entities.yaml` e `mapping.json` por caso (não versionar)
 - `output/mapping.json` — chave de reidentificação (não versionar)

@@ -12,6 +12,7 @@ from pdf_anonymizer.discovery import extract_page_text
 from pdf_anonymizer.fakes import Entity
 from pdf_anonymizer.matcher import collect_segment_texts, extract_page_chars
 from pdf_anonymizer.renderer import _collect_fragments
+from pdf_anonymizer.text_utils import alnum_skeleton, digit_skeleton
 
 POSITION_TOLERANCE = 3.0
 
@@ -21,6 +22,11 @@ class ValidationResult:
     ok: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def output_name_for(input_pdf: Path) -> str:
+    """Legacy docs/ mode output filename."""
+    return f"{input_pdf.stem}-Anonimizado.pdf"
 
 
 def _segmented_text(doc: fitz.Document) -> str:
@@ -33,10 +39,41 @@ def _check_length_coherence(mapping: dict[str, str], entities: list[Entity] | No
     for orig, fake in mapping.items():
         if orig in exempt:
             continue
-        if len(orig) != len(fake):
+        if len(alnum_skeleton(orig)) != len(alnum_skeleton(fake)):
             errors.append(
-                f"Length mismatch for {orig!r}: original={len(orig)} fake={len(fake)} ({fake!r})"
+                f"Alnum length mismatch for {orig!r}: {fake!r}"
             )
+    return errors
+
+
+def _check_digit_skeleton_leaks(text: str, originals: list[str], entities: list[Entity] | None) -> list[str]:
+    errors: list[str] = []
+    exempt = {e.original for e in (entities or []) if e.kind == "name"}
+    hay = digit_skeleton(text)
+    for orig in originals:
+        if orig in exempt:
+            continue
+        sk = digit_skeleton(orig)
+        if len(sk) >= 6 and sk in hay:
+            errors.append(f"Digit skeleton leak: {orig!r} ({sk})")
+    return errors
+
+
+def _check_name_parts(
+    output_path: Path,
+    text: str,
+    holder_name: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    if not holder_name:
+        return errors
+    for part in holder_name.split():
+        if len(part) < 3:
+            continue
+        if part in text or part.upper() in text.upper():
+            errors.append(f"{output_path.name}: name part still present: {part!r}")
+        if part.upper() in output_path.name.upper():
+            errors.append(f"{output_path.name}: name part in filename: {part!r}")
     return errors
 
 
@@ -44,11 +81,8 @@ def _check_cross_document_coherence(
     outputs: dict[str, fitz.Document],
     mapping: dict[str, str],
 ) -> list[str]:
-    """Shared originals must map to the same fake in every output file."""
     errors: list[str] = []
-    segmented: dict[str, str] = {
-        name: _segmented_text(doc) for name, doc in outputs.items()
-    }
+    segmented: dict[str, str] = {name: _segmented_text(doc) for name, doc in outputs.items()}
 
     for orig, fake in mapping.items():
         present_in = [name for name, text in segmented.items() if orig in text or fake in text]
@@ -58,9 +92,7 @@ def _check_cross_document_coherence(
             if name not in present_in:
                 continue
             if fake not in text and fake not in re.sub(r"\s+", "", text):
-                errors.append(
-                    f"Cross-doc coherence: {fake!r} for {orig!r} missing in {name}"
-                )
+                errors.append(f"Cross-doc coherence: {fake!r} for {orig!r} missing in {name}")
     return errors
 
 
@@ -70,7 +102,6 @@ def _check_positions(
     entities: list[Entity],
     mapping: dict[str, str],
 ) -> list[str]:
-    """Inserted fakes should appear near the original character origins."""
     errors: list[str] = []
     orig_doc = fitz.open(input_path)
     out_doc = fitz.open(output_path)
@@ -128,6 +159,8 @@ def validate_pdf(
     *,
     expected_pages: int | None = None,
     segmented: str | None = None,
+    entities: list[Entity] | None = None,
+    holder_name: str | None = None,
 ) -> ValidationResult:
     result = ValidationResult(ok=True)
     doc = fitz.open(output_path)
@@ -143,6 +176,7 @@ def validate_pdf(
             segmented = _segmented_text(doc)
         normalized = re.sub(r"\s+", "", text)
         segmented_norm = re.sub(r"\s+", "", segmented)
+        combined = text + "\n" + segmented
 
         for orig in originals:
             if (
@@ -156,12 +190,17 @@ def validate_pdf(
                 )
                 result.ok = False
 
+        result.errors.extend(_check_name_parts(output_path, combined, holder_name))
+        if result.errors:
+            result.ok = False
+
         for fake in fakes:
+            sk = alnum_skeleton(fake)
             if (
                 fake not in text
                 and fake not in normalized
-                and fake not in segmented
-                and fake not in segmented_norm
+                and sk not in alnum_skeleton(text)
+                and sk not in alnum_skeleton(segmented)
             ):
                 result.warnings.append(
                     f"{output_path.name}: fake value not found in text: {fake!r}"
@@ -176,8 +215,24 @@ def validate_pdf(
     return result
 
 
-def output_name_for(input_pdf: Path) -> str:
-    return f"{input_pdf.stem}-Anonimizado.pdf"
+def render_preview_pngs(
+    input_pdf: Path,
+    output_pdf: Path,
+    pages: list[int],
+    dest_dir: Path,
+) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for label, path in (("before", input_pdf), ("after", output_pdf)):
+        doc = fitz.open(path)
+        try:
+            for pno in pages:
+                if pno < 1 or pno > doc.page_count:
+                    continue
+                pix = doc[pno - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
+                out = dest_dir / f"{label}-p{pno:02d}.png"
+                pix.save(out)
+        finally:
+            doc.close()
 
 
 def validate_outputs(
@@ -185,6 +240,7 @@ def validate_outputs(
     input_dir: Path,
     mapping: dict[str, str],
     entities: list[Entity] | None = None,
+    holder_name: str | None = None,
 ) -> ValidationResult:
     combined = ValidationResult(ok=True)
     originals = list(mapping.keys())
@@ -215,6 +271,8 @@ def validate_outputs(
                 fakes,
                 expected_pages=expected_pages,
                 segmented=segmented,
+                entities=entities,
+                holder_name=holder_name,
             )
             combined.errors.extend(r.errors)
             combined.warnings.extend(r.warnings)
@@ -239,4 +297,46 @@ def validate_outputs(
     if combined.errors:
         combined.ok = False
 
+    return combined
+
+
+def validate_case(
+    input_pdf: Path,
+    output_pdf: Path,
+    mapping: dict[str, str],
+    entities: list[Entity],
+    holder_name: str | None = None,
+) -> ValidationResult:
+    combined = ValidationResult(ok=True)
+    combined.errors.extend(_check_length_coherence(mapping, entities))
+
+    src = fitz.open(input_pdf)
+    expected_pages = src.page_count
+    src.close()
+
+    out_doc = fitz.open(output_pdf)
+    segmented = _segmented_text(out_doc)
+    out_doc.close()
+
+    r = validate_pdf(
+        output_pdf,
+        list(mapping.keys()),
+        list(mapping.values()),
+        expected_pages=expected_pages,
+        segmented=segmented,
+        entities=entities,
+        holder_name=holder_name,
+    )
+    combined.errors.extend(r.errors)
+    combined.warnings.extend(r.warnings)
+    if not r.ok:
+        combined.ok = False
+
+    pos_errors = _check_positions(input_pdf, output_pdf, entities, mapping)
+    combined.errors.extend(pos_errors)
+    if pos_errors:
+        combined.ok = False
+
+    if combined.errors:
+        combined.ok = False
     return combined

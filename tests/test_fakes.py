@@ -49,7 +49,12 @@ def test_ctc_shared_trunk():
 
 def test_name_replacement():
     entities = [
-        Entity(id="nome", kind="name", original="MARIA DE FATIMA RAMALHO MIRANDA"),
+        Entity(
+            id="nome",
+            kind="name",
+            original="MARIA DE FATIMA RAMALHO MIRANDA",
+            replacement="MARIA DA SILVA",
+        ),
     ]
     m = build_mapping(entities, seed=42)
     assert m["MARIA DE FATIMA RAMALHO MIRANDA"] == "MARIA DA SILVA"
